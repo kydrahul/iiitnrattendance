@@ -10,7 +10,29 @@ require('dotenv').config();
 
 // Initialize Firebase Admin
 const admin = require('firebase-admin');
-const serviceAccount = require('./iiitnr-attendence-app-f604e-firebase-adminsdk-fbsvc-e79f0f1be5.json');
+
+// Use environment variable for Firebase credentials (for Render/production)
+// or fall back to local service account file (for local development)
+let serviceAccount;
+if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+  // Production: Use service account from environment variable
+  try {
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    console.log('✅ Using Firebase service account from environment variable');
+  } catch (error) {
+    console.error('❌ Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON:', error.message);
+    process.exit(1);
+  }
+} else {
+  // Development: Use local service account file
+  try {
+    serviceAccount = require('./iiitnr-attendence-app-f604e-firebase-adminsdk-fbsvc-e79f0f1be5.json');
+    console.log('✅ Using Firebase service account from local file');
+  } catch (error) {
+    console.error('❌ Firebase service account not found. Please set FIREBASE_SERVICE_ACCOUNT_JSON environment variable or add the JSON file.');
+    process.exit(1);
+  }
+}
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
