@@ -18,16 +18,14 @@ const firebaseConfig = {
   measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID as string | undefined,
 };
 
-// Basic sanity check - fail fast in dev so missing envs are obvious
+// Basic sanity check - log warning instead of throwing error
 if (
   !firebaseConfig.apiKey ||
   !firebaseConfig.authDomain ||
-  !firebaseConfig.projectId ||
-  !firebaseConfig.storageBucket ||
-  !firebaseConfig.appId
+  !firebaseConfig.projectId
 ) {
-  throw new Error(
-    "Missing required VITE_FIREBASE_* env vars. Add them to .env.local or .env and restart the dev server."
+  console.warn(
+    "Some Firebase env vars are missing. The app may not function correctly. Check .env file."
   );
 }
 

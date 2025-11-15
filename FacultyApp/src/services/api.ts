@@ -1,97 +1,75 @@
-import { auth } from '../firebaseConfig';
+import { getIdToken } from './firebase';
 
-// Backend API URL - update this to match your backend
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000';
+// Always use localhost for backend, even if frontend is accessed via network IP
+const API_BASE = 'http://localhost:4000';
 
-export interface QRTokenResponse {
-  qrToken: string;
-}
+async function request(path: string, options: RequestInit = {}) {
+  const token = await getIdToken();
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(options.headers as Record<string, string> || {}),
+  };
+  if (token) headers.Authorization = `Bearer ${token}`;
 
-export interface AttendanceRecord {
-  id: string;
-  sessionId: string;
-  courseId: string;
-  studentId: string;
-  studentName: string;
-  studentEmail: string;
-  lat: number | null;
-  lng: number | null;
-  timestamp: Date;
-  recordedAt: Date;
-}
-
-export interface AttendanceResponse {
-  success: boolean;
-  attendance: AttendanceRecord[];
-}
-
-/**
- * Generate a QR token for a class session
- */
-export async function generateQRToken(
-  sessionId: string,
-  courseId: string,
-  ttlSeconds: number = 120
-): Promise<string> {
-  const user = auth.currentUser;
-  if (!user) {
-    throw new Error('User not authenticated');
-  }
-
-  const idToken = await user.getIdToken();
-
-  const response = await fetch(`${API_URL}/generate-qr`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${idToken}`,
-    },
-    body: JSON.stringify({
-      sessionId,
-      courseId,
-      ttlSeconds,
-    }),
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers,
   });
 
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.error || 'Failed to generate QR token');
+  const text = await res.text();
+  let data: any = null;
+  try { data = text ? JSON.parse(text) : null; } catch(e) { data = text; }
+
+  if (!res.ok) {
+    const err = new Error(data?.error || res.statusText || 'Request failed');
+    (err as any).status = res.status;
+    (err as any).body = data;
+    throw err;
   }
 
-  const data: QRTokenResponse = await response.json();
-  return data.qrToken;
+  return data;
 }
 
-/**
- * Fetch attendance records for a session
- */
-export async function getAttendance(sessionId: string): Promise<AttendanceRecord[]> {
-  const user = auth.currentUser;
-  if (!user) {
-    throw new Error('User not authenticated');
-  }
+export async function createFacultyProfile(payload: any) {
+  return request('/api/faculty/profile', { method: 'POST', body: JSON.stringify(payload) });
+}
 
-  const idToken = await user.getIdToken();
+export async function createCourse(payload: any) {
+  return request('/api/faculty/courses', { method: 'POST', body: JSON.stringify(payload) });
+}
 
-  const response = await fetch(`${API_URL}/attendance/${sessionId}`, {
-    method: 'GET',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${idToken}`,
-    },
+export async function listCourses() {
+  return request('/api/faculty/courses', { method: 'GET' });
+}
+
+export async function deleteCourse(courseId: string) {
+  return request(`/api/faculty/courses/${courseId}`, { method: 'DELETE' });
+}
+
+export async function createFullClass(payload: any) {
+  return request('/api/faculty/classes/full', { method: 'POST', body: JSON.stringify(payload) });
+}
+
+export async function generateQr(payload: any) {
+  return request('/api/faculty/generate-qr', { method: 'POST', body: JSON.stringify(payload) });
+}
+
+export async function getSessionAttendance(sessionId: string) {
+  return request(`/api/faculty/session/${sessionId}/attendance`, { method: 'GET' });
+}
+
+export async function stopSession(sessionId: string) {
+  return request(`/api/faculty/session/${sessionId}/stop`, { method: 'POST' });
+}
+
+export async function listCourseStudents(courseId: string, sessionId?: string) {
+  const q = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : '';
+  return request(`/api/faculty/course/${courseId}/students${q}`, { method: 'GET' });
+}
+
+export async function saveManualAttendance(sessionId: string, presentStudentIds: string[]) {
+  return request(`/api/faculty/session/${sessionId}/manual-attendance`, { 
+    method: 'POST', 
+    body: JSON.stringify({ presentStudentIds })
   });
-
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.error || 'Failed to fetch attendance');
-  }
-
-  const data: AttendanceResponse = await response.json();
-  
-  // Convert timestamp strings back to Date objects
-  return data.attendance.map(record => ({
-    ...record,
-    timestamp: new Date(record.timestamp),
-    recordedAt: new Date(record.recordedAt),
-  }));
 }

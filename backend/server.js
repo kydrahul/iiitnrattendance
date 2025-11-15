@@ -10,22 +10,7 @@ require('dotenv').config();
 
 // Initialize Firebase Admin
 const admin = require('firebase-admin');
-
-// Load service account from environment variable or file
-let serviceAccount;
-if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-  // Production: Load from secret file path
-  serviceAccount = require(process.env.GOOGLE_APPLICATION_CREDENTIALS);
-} else {
-  // Development: Load from local file
-  try {
-    serviceAccount = require('./iiitnr-attendence-app-f604e-firebase-adminsdk-fbsvc-e79f0f1be5.json');
-  } catch (err) {
-    console.error('❌ Firebase service account not found!');
-    console.error('   Set GOOGLE_APPLICATION_CREDENTIALS environment variable in production');
-    process.exit(1);
-  }
-}
+const serviceAccount = require('./iiitnr-attendence-app-f604e-firebase-adminsdk-fbsvc-e79f0f1be5.json');
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -44,26 +29,7 @@ const PORT = process.env.PORT || 4000;
 
 // Middleware
 app.use(helmet());
-
-// Configure CORS for production
-const allowedOrigins = process.env.ALLOWED_ORIGINS 
-  ? process.env.ALLOWED_ORIGINS.split(',')
-  : ['http://localhost:8080', 'http://localhost:8081', 'http://localhost:3000'];
-
-app.use(cors({
-  origin: function(origin, callback) {
-    // Allow requests with no origin (mobile apps, Postman, etc.)
-    if (!origin) return callback(null, true);
-    
-    if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV !== 'production') {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
-  credentials: true
-}));
-
+app.use(cors());
 app.use(compression());
 app.use(express.json());
 app.use(morgan('dev'));
@@ -524,7 +490,10 @@ app.post('/api/faculty/classes/full', verifyToken, async (req, res) => {
       courseCode,
       className,
       section = 'A',
-      timetable = [] // Array<{ day, time, type, room? }>
+      timetable = [], // Array<{ day, time, type, room? }>
+      credits,
+      semester,
+      session
     } = req.body || {};
 
     if (!branch || !year || !courseName || !courseCode) {
@@ -562,6 +531,9 @@ app.post('/api/faculty/classes/full', verifyToken, async (req, res) => {
       isActive: true,
       timetable: Array.isArray(timetable) ? timetable : [],
       enrolledCount: 0,
+      credits: credits || 3,
+      semester: semester || '',
+      session: session || 'Spring',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
@@ -573,6 +545,49 @@ app.post('/api/faculty/classes/full', verifyToken, async (req, res) => {
   } catch (error) {
     console.error('Error creating full class:', error);
     res.status(500).json({ error: 'Failed to create full class' });
+  }
+});
+
+// Delete a course
+app.delete('/api/faculty/courses/:courseId', verifyToken, async (req, res) => {
+  try {
+    const facultyId = req.user.uid;
+    const { courseId } = req.params;
+
+    if (!courseId) {
+      return res.status(400).json({ error: 'courseId is required' });
+    }
+
+    // Check if course exists and belongs to faculty
+    const courseDoc = await db.collection('courses').doc(courseId).get();
+    
+    if (!courseDoc.exists) {
+      return res.status(404).json({ error: 'Course not found' });
+    }
+
+    const courseData = courseDoc.data();
+    if (courseData.facultyId !== facultyId) {
+      return res.status(403).json({ error: 'Not authorized to delete this course' });
+    }
+
+    // Delete the course
+    await db.collection('courses').doc(courseId).delete();
+
+    // Optionally: Delete related enrollments
+    const enrollmentsSnapshot = await db.collection('enrollments')
+      .where('courseId', '==', courseId)
+      .get();
+    
+    const batch = db.batch();
+    enrollmentsSnapshot.docs.forEach(doc => {
+      batch.delete(doc.ref);
+    });
+    await batch.commit();
+
+    res.json({ success: true, message: 'Course deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting course:', error);
+    res.status(500).json({ error: 'Failed to delete course' });
   }
 });
 
@@ -970,7 +985,8 @@ app.post('/api/student/join-course', verifyToken, async (req, res) => {
 // START SERVER
 // ============================================
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 IIIT NR Attendance Backend running on port ${PORT}`);
   console.log(`📍 Health check: http://localhost:${PORT}/health`);
+  console.log(`📱 Network: http://192.168.137.1:${PORT}/health`);
 });
