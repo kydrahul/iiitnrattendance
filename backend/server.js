@@ -54,6 +54,25 @@ const auth = admin.auth();
 // Safer Firestore writes: ignore undefined values globally as a fallback
 db.settings({ ignoreUndefinedProperties: true });
 
+// ============================================
+// GEOFENCE CONFIGURATION
+// ============================================
+
+// College campus coordinates (IIITNR Academic Building)
+const GEOFENCE_CONFIG = {
+  latitude: parseFloat(process.env.COLLEGE_LATITUDE || '21.128471766438903'),
+  longitude: parseFloat(process.env.COLLEGE_LONGITUDE || '81.76613230185365'),
+  defaultRadius: parseInt(process.env.COLLEGE_GEOFENCE_RADIUS || '1200'), // meters
+  minRadius: 15, // minimum allowed by faculty
+  maxRadius: 1200 // maximum allowed by faculty
+};
+
+console.log('✅ Geofence configured:', {
+  lat: GEOFENCE_CONFIG.latitude,
+  lng: GEOFENCE_CONFIG.longitude,
+  radius: GEOFENCE_CONFIG.defaultRadius
+});
+
 // Initialize Express
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -322,7 +341,12 @@ app.post('/api/student/profile', verifyToken, async (req, res) => {
       batch,
       semester,
       department,
-      email: emailFromBody
+      email: emailFromBody,
+      mobile,
+      mobileNumber,
+      passingYear,
+      passingOutYear,
+      branch
     } = req.body;
     const userId = req.user.uid;
 
@@ -335,7 +359,9 @@ app.post('/api/student/profile', verifyToken, async (req, res) => {
       year,
       batch,
       semester,
-      department,
+      department: department || branch,
+      mobile: mobile || mobileNumber,
+      passingYear: passingYear || passingOutYear,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
@@ -349,6 +375,43 @@ app.post('/api/student/profile', verifyToken, async (req, res) => {
   } catch (error) {
     console.error('Error creating student profile:', error);
     res.status(500).json({ error: 'Failed to create student profile' });
+  }
+});
+
+// Get Student Profile
+app.get('/api/student/profile', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+
+    // Check cache first
+    const cacheKey = `student:${userId}`;
+    const cached = studentCache.get(cacheKey);
+    if (cached) {
+      console.log(`✅ Cache hit: profile for ${userId}`);
+      return res.json({ success: true, student: cached });
+    }
+
+    console.log(`👤 Cache miss: fetching profile for ${userId}`);
+
+    // Get student data from Firestore
+    const studentDoc = await db.collection('students').doc(userId).get();
+
+    if (!studentDoc.exists) {
+      return res.status(404).json({
+        error: 'Profile not found',
+        message: 'Please complete your profile setup'
+      });
+    }
+
+    const student = studentDoc.data();
+
+    // Cache the result
+    studentCache.set(cacheKey, student);
+
+    res.json({ success: true, student });
+  } catch (error) {
+    console.error('Error fetching student profile:', error);
+    res.status(500).json({ error: 'Failed to fetch student profile' });
   }
 });
 
@@ -641,6 +704,61 @@ app.get('/api/student/attendance-history', verifyToken, async (req, res) => {
   } catch (error) {
     console.error('Error fetching attendance history:', error);
     res.status(500).json({ error: 'Failed to fetch attendance history' });
+  }
+});
+
+// Verify Location (Pre-check before QR scanning)
+app.post('/api/student/verify-location', verifyToken, async (req, res) => {
+  try {
+    const { latitude, longitude, accuracy } = req.body;
+    const userId = req.user.uid;
+
+    // Validate input
+    if (!latitude || !longitude) {
+      return res.status(400).json({ error: 'Latitude and longitude are required' });
+    }
+
+    // Calculate distance from campus
+    const distanceFromCampus = calculateDistance(
+      latitude,
+      longitude,
+      GEOFENCE_CONFIG.latitude,
+      GEOFENCE_CONFIG.longitude
+    );
+
+    const maxDistance = GEOFENCE_CONFIG.defaultRadius;
+    const isValid = distanceFromCampus <= maxDistance;
+
+    // Create expiry time (1 hour from now)
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    if (!isValid) {
+      return res.status(403).json({
+        success: false,
+        valid: false,
+        error: `You are too far from campus (${Math.round(distanceFromCampus)}m away, max ${maxDistance}m allowed)`,
+        distance: Math.round(distanceFromCampus),
+        maxDistance,
+        accuracy: accuracy || null
+      });
+    }
+
+    // Log successful verification
+    console.log(`✅ Location verified for ${userId}: ${Math.round(distanceFromCampus)}m from campus`);
+
+    res.json({
+      success: true,
+      valid: true,
+      message: 'Location verified successfully',
+      distance: Math.round(distanceFromCampus),
+      maxDistance,
+      accuracy: accuracy || null,
+      expiresAt: expiresAt.toISOString(),
+      validFor: '1 hour'
+    });
+  } catch (error) {
+    console.error('Error verifying location:', error);
+    res.status(500).json({ error: 'Failed to verify location' });
   }
 });
 
