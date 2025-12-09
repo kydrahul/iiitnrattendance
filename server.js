@@ -54,22 +54,35 @@ const auth = admin.auth();
 // Safer Firestore writes: ignore undefined values globally as a fallback
 db.settings({ ignoreUndefinedProperties: true });
 
+// ============================================
+// GEOFENCE CONFIGURATION
+// ============================================
+
+// College campus coordinates (IIITNR Academic Building)
+const GEOFENCE_CONFIG = {
+  latitude: parseFloat(process.env.COLLEGE_LATITUDE || '21.128471766438903'),
+  longitude: parseFloat(process.env.COLLEGE_LONGITUDE || '81.76613230185365'),
+  defaultRadius: parseInt(process.env.COLLEGE_GEOFENCE_RADIUS || '1200'), // meters
+  minRadius: 15, // minimum allowed by faculty
+  maxRadius: 1200 // maximum allowed by faculty
+};
+
+console.log('✅ Geofence configured:', {
+  lat: GEOFENCE_CONFIG.latitude,
+  lng: GEOFENCE_CONFIG.longitude,
+  radius: GEOFENCE_CONFIG.defaultRadius
+});
+
 // Initialize Express
 const app = express();
 const PORT = process.env.PORT || 4000;
 
 // Middleware
 app.use(helmet());
+// CORS: Allow all origins for mobile app support
+// Mobile apps don't send Origin header, so we need to allow all
 app.use(cors({
-  origin: [
-    'http://localhost:8080',
-    'http://localhost:5173',
-    'http://localhost:3000',
-    'https://iiitnrattendence.netlify.app',
-    'https://iiitnrattendence.vercel.app',
-    'https://rahull-prog.github.io',
-    'https://kydrahul.github.io'
-  ],
+  origin: true, // Allow all origins (needed for mobile apps)
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-device-id']
@@ -322,7 +335,12 @@ app.post('/api/student/profile', verifyToken, async (req, res) => {
       batch,
       semester,
       department,
-      email: emailFromBody
+      email: emailFromBody,
+      mobile,
+      mobileNumber,
+      passingYear,
+      passingOutYear,
+      branch
     } = req.body;
     const userId = req.user.uid;
 
@@ -335,7 +353,9 @@ app.post('/api/student/profile', verifyToken, async (req, res) => {
       year,
       batch,
       semester,
-      department,
+      department: department || branch,
+      mobile: mobile || mobileNumber,
+      passingYear: passingYear || passingOutYear,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
@@ -349,6 +369,43 @@ app.post('/api/student/profile', verifyToken, async (req, res) => {
   } catch (error) {
     console.error('Error creating student profile:', error);
     res.status(500).json({ error: 'Failed to create student profile' });
+  }
+});
+
+// Get Student Profile
+app.get('/api/student/profile', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+
+    // Check cache first
+    const cacheKey = `student:${userId}`;
+    const cached = studentCache.get(cacheKey);
+    if (cached) {
+      console.log(`✅ Cache hit: profile for ${userId}`);
+      return res.json({ success: true, student: cached });
+    }
+
+    console.log(`👤 Cache miss: fetching profile for ${userId}`);
+
+    // Get student data from Firestore
+    const studentDoc = await db.collection('students').doc(userId).get();
+
+    if (!studentDoc.exists) {
+      return res.status(404).json({
+        error: 'Profile not found',
+        message: 'Please complete your profile setup'
+      });
+    }
+
+    const student = studentDoc.data();
+
+    // Cache the result
+    studentCache.set(cacheKey, student);
+
+    res.json({ success: true, student });
+  } catch (error) {
+    console.error('Error fetching student profile:', error);
+    res.status(500).json({ error: 'Failed to fetch student profile' });
   }
 });
 
@@ -455,6 +512,7 @@ app.get('/api/student/dashboard', verifyToken, async (req, res) => {
 });
 
 // Scan QR and Mark Attendance - OPTIMIZED with Denormalization
+// Scan QR and Mark Attendance - OPTIMIZED with Denormalization
 app.post('/api/student/scan-qr', verifyToken, async (req, res) => {
   try {
     const { qrData, latitude, longitude, accuracy } = req.body;
@@ -478,6 +536,17 @@ app.post('/api/student/scan-qr', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'QR code has expired' });
     }
 
+    // NEW: Check if QR is the LATEST version (if versioning is used)
+    if (payload.qrVersion) {
+      const activeQRDoc = await db.collection('activeQRs').doc(payload.sessionId).get();
+      if (activeQRDoc.exists) {
+        const activeQR = activeQRDoc.data();
+        if (activeQR.qrVersion && payload.qrVersion !== activeQR.qrVersion) {
+          return res.status(400).json({ error: 'QR code has expired (new QR available)' });
+        }
+      }
+    }
+
     // Get session details
     const sessionDoc = await db.collection('sessions').doc(payload.sessionId).get();
     if (!sessionDoc.exists) {
@@ -498,15 +567,29 @@ app.post('/api/student/scan-qr', verifyToken, async (req, res) => {
       return res.status(403).json({ error: 'You are not enrolled in this course' });
     }
 
-    // Check if already marked
-    const existingAttendance = await db.collection('attendance')
+    // Check existing attendance
+    const attendanceSnapshot = await db.collection('attendance')
       .where('sessionId', '==', payload.sessionId)
       .where('studentId', '==', userId)
       .limit(1)
       .get();
 
-    if (!existingAttendance.empty) {
-      return res.status(400).json({ error: 'Attendance already marked for this session' });
+    let attendanceRef;
+    let isNew = false;
+
+    if (!attendanceSnapshot.empty) {
+      const attendanceDoc = attendanceSnapshot.docs[0];
+      const attendanceData = attendanceDoc.data();
+
+      if (attendanceData.status === 'present') {
+        return res.status(400).json({ error: 'Attendance already marked for this session' });
+      }
+
+      attendanceRef = attendanceDoc.ref;
+    } else {
+      // Fallback: Create new if not found (e.g. late enrollment)
+      attendanceRef = db.collection('attendance').doc();
+      isNew = true;
     }
 
     // Verify geolocation if required
@@ -521,7 +604,7 @@ app.post('/api/student/scan-qr', verifyToken, async (req, res) => {
         payload.location.longitude
       );
 
-      const maxDistance = payload.location.radius || 1100; // Default 1100 meters (for indoor GPS inaccuracy)
+      const maxDistance = payload.location.radius || 1100; // Default 1100 meters
       locationVerified = distanceFromClass <= maxDistance;
 
       if (!locationVerified) {
@@ -551,15 +634,8 @@ app.post('/api/student/scan-qr', verifyToken, async (req, res) => {
       }
     }
 
-    // OPTIMIZED: Denormalize student and course info in attendance record
-    const attendanceData = {
-      sessionId: payload.sessionId,
-      courseId: payload.courseId,
-      studentId: userId,
-      studentName,  // Denormalized - eliminates future reads!
-      studentRollNo,  // Denormalized - eliminates future reads!
-      courseName: session.courseName || 'Unknown',  // Denormalized
-      courseCode: session.courseCode || 'N/A',  // Denormalized
+    // Update Data
+    const updateData = {
       status: 'present',
       markedAt: admin.firestore.FieldValue.serverTimestamp(),
       markedBy: 'student',
@@ -569,10 +645,27 @@ app.post('/api/student/scan-qr', verifyToken, async (req, res) => {
       distanceFromClass: Math.round(distanceFromClass),
       accuracy: accuracy || null,
       qrTimestamp: payload.timestamp,
-      deviceId: req.headers['x-device-id'] || 'unknown'
+      deviceId: req.headers['x-device-id'] || 'unknown',
+      qrVersion: payload.qrVersion || null
     };
 
-    const attendanceRef = await db.collection('attendance').add(attendanceData);
+    if (isNew) {
+      // Denormalize student and course info in attendance record
+      const attendanceData = {
+        sessionId: payload.sessionId,
+        courseId: payload.courseId,
+        studentId: userId,
+        studentName,
+        studentRollNo,
+        courseName: session.courseName || 'Unknown',
+        courseCode: session.courseCode || 'N/A',
+        ...updateData,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+      await attendanceRef.set(attendanceData);
+    } else {
+      await attendanceRef.update(updateData);
+    }
 
     // Update session present count
     await db.collection('sessions').doc(payload.sessionId).update({
@@ -587,7 +680,7 @@ app.post('/api/student/scan-qr', verifyToken, async (req, res) => {
       message: 'Attendance marked successfully!',
       attendance: {
         id: attendanceRef.id,
-        ...attendanceData,
+        status: 'present',
         distance: Math.round(distanceFromClass)
       }
     });
@@ -641,6 +734,61 @@ app.get('/api/student/attendance-history', verifyToken, async (req, res) => {
   } catch (error) {
     console.error('Error fetching attendance history:', error);
     res.status(500).json({ error: 'Failed to fetch attendance history' });
+  }
+});
+
+// Verify Location (Pre-check before QR scanning)
+app.post('/api/student/verify-location', verifyToken, async (req, res) => {
+  try {
+    const { latitude, longitude, accuracy } = req.body;
+    const userId = req.user.uid;
+
+    // Validate input
+    if (!latitude || !longitude) {
+      return res.status(400).json({ error: 'Latitude and longitude are required' });
+    }
+
+    // Calculate distance from campus
+    const distanceFromCampus = calculateDistance(
+      latitude,
+      longitude,
+      GEOFENCE_CONFIG.latitude,
+      GEOFENCE_CONFIG.longitude
+    );
+
+    const maxDistance = GEOFENCE_CONFIG.defaultRadius;
+    const isValid = distanceFromCampus <= maxDistance;
+
+    // Create expiry time (1 hour from now)
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    if (!isValid) {
+      return res.status(403).json({
+        success: false,
+        valid: false,
+        error: `You are too far from campus (${Math.round(distanceFromCampus)}m away, max ${maxDistance}m allowed)`,
+        distance: Math.round(distanceFromCampus),
+        maxDistance,
+        accuracy: accuracy || null
+      });
+    }
+
+    // Log successful verification
+    console.log(`✅ Location verified for ${userId}: ${Math.round(distanceFromCampus)}m from campus`);
+
+    res.json({
+      success: true,
+      valid: true,
+      message: 'Location verified successfully',
+      distance: Math.round(distanceFromCampus),
+      maxDistance,
+      accuracy: accuracy || null,
+      expiresAt: expiresAt.toISOString(),
+      validFor: '1 hour'
+    });
+  } catch (error) {
+    console.error('Error verifying location:', error);
+    res.status(500).json({ error: 'Failed to verify location' });
   }
 });
 
@@ -746,17 +894,83 @@ app.get('/api/student/courses', verifyToken, async (req, res) => {
         });
       }
 
-      // Combine data
+      // Get attendance stats for all courses
+      const attendanceSnapshot = await db.collection('attendance')
+        .where('studentId', '==', userId)
+        .where('courseId', 'in', courseIds.slice(0, 10)) // Firestore 'in' limit is 10
+        .get();
+
+      // Build attendance map by courseId
+      const attendanceMap = new Map();
+      attendanceSnapshot.docs.forEach(doc => {
+        const data = doc.data();
+        const courseId = data.courseId;
+
+        if (!attendanceMap.has(courseId)) {
+          attendanceMap.set(courseId, { total: 0, present: 0, absent: 0 });
+        }
+        const stats = attendanceMap.get(courseId);
+        stats.total++;
+        if (data.status === 'present') {
+          stats.present++;
+        } else {
+          stats.absent++;
+        }
+      });
+
+      // If more than 10 courses, fetch remaining attendance in batches
+      if (courseIds.length > 10) {
+        for (let i = 10; i < courseIds.length; i += 10) {
+          const batch = courseIds.slice(i, i + 10);
+          const batchSnapshot = await db.collection('attendance')
+            .where('studentId', '==', userId)
+            .where('courseId', 'in', batch)
+            .get();
+
+          batchSnapshot.docs.forEach(doc => {
+            const data = doc.data();
+            const courseId = data.courseId;
+            if (!attendanceMap.has(courseId)) {
+              attendanceMap.set(courseId, { total: 0, present: 0, absent: 0 });
+            }
+            const stats = attendanceMap.get(courseId);
+            stats.total++;
+            if (data.status === 'present') {
+              stats.present++;
+            } else {
+              stats.absent++;
+            }
+          });
+        }
+      }
+
+      // Combine data with attendance stats and faculty contact
       courseDocs.forEach((courseDoc, index) => {
         if (courseDoc.exists) {
           const courseData = courseDoc.data();
           const facultyData = facultyMap.get(courseData.facultyId);
+          const attendanceStats = attendanceMap.get(courseDoc.id) || { total: 0, present: 0, absent: 0 };
+
+          // Calculate attendance percentage
+          const attendancePercentage = attendanceStats.total > 0
+            ? Math.round((attendanceStats.present / attendanceStats.total) * 100)
+            : 0;
 
           courses.push({
             id: courseDoc.id,
             ...courseData,
             facultyName: facultyData?.name || 'Unknown',
-            enrolledDate: enrollmentsSnapshot.docs[index].data().enrolledAt
+            enrolledDate: enrollmentsSnapshot.docs[index].data().enrolledAt,
+            // Add attendance statistics
+            totalClasses: attendanceStats.total,
+            attended: attendanceStats.present,
+            missed: attendanceStats.absent,
+            attendance: attendancePercentage,
+            // Add faculty contact information
+            contact: {
+              email: facultyData?.email || 'N/A',
+              phone: facultyData?.mobile || facultyData?.phone || 'N/A'
+            }
           });
         }
       });
@@ -872,6 +1086,27 @@ app.get('/api/student/timetable', verifyToken, async (req, res) => {
 // FACULTY ROUTES
 // ============================================
 
+// ============================================================================
+// FACULTY PROFILE ENDPOINTS
+// ============================================================================
+
+// Get Faculty Profile
+app.get('/api/faculty/profile', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const facultyDoc = await db.collection('faculty').doc(userId).get();
+
+    if (!facultyDoc.exists) {
+      return res.json({ success: true, faculty: null });
+    }
+
+    res.json({ success: true, faculty: facultyDoc.data() });
+  } catch (error) {
+    console.error('Error fetching faculty profile:', error);
+    res.status(500).json({ error: 'Failed to fetch faculty profile' });
+  }
+});
+
 // Create/Update Faculty Profile
 app.post('/api/faculty/profile', verifyToken, async (req, res) => {
   try {
@@ -882,7 +1117,9 @@ app.post('/api/faculty/profile', verifyToken, async (req, res) => {
       designation,
       department,
       specialization,
-      email: emailFromBody
+      email: emailFromBody,
+      phone,
+      mobile
     } = req.body;
     const userId = req.user.uid;
 
@@ -894,6 +1131,8 @@ app.post('/api/faculty/profile', verifyToken, async (req, res) => {
       designation,
       department,
       specialization,
+      phone,
+      mobile,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
@@ -916,6 +1155,23 @@ app.post('/api/faculty/courses', verifyToken, async (req, res) => {
     // Basic validation to give user-friendly 400 instead of 500
     if (!code || !name || !department) {
       return res.status(400).json({ error: 'Missing required fields: code, name, department' });
+    }
+
+    // Auto-create/update faculty profile if it doesn't exist
+    // This ensures faculty data is available for Student App
+    const facultyDoc = await db.collection('faculty').doc(facultyId).get();
+    if (!facultyDoc.exists) {
+      console.log(`📝 Auto-creating faculty profile for ${facultyId}`);
+      const facultyData = cleanObject({
+        userId: facultyId,
+        email: req.user.email,
+        name: req.user.name || req.user.displayName || req.user.email?.split('@')[0] || 'Faculty',
+        department,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      await db.collection('faculty').doc(facultyId).set(facultyData, { merge: true });
+      console.log(`✅ Faculty profile created for ${facultyId}: ${facultyData.name}`);
     }
 
     const courseData = cleanObject({
@@ -1098,6 +1354,7 @@ app.delete('/api/faculty/courses/:courseId', verifyToken, async (req, res) => {
 });
 
 // Generate QR Code for Session
+// Generate QR Code for Session (Start Session)
 app.post('/api/faculty/generate-qr', verifyToken, async (req, res) => {
   try {
     // Accept both old keys and the ones in the guide
@@ -1107,7 +1364,8 @@ app.post('/api/faculty/generate-qr', verifyToken, async (req, res) => {
     const latitude = req.body.latitude ?? location.latitude;
     const longitude = req.body.longitude ?? location.longitude;
     const radius = req.body.radius ?? req.body.geofenceRadius ?? (location.radius ?? 50);
-    const validitySeconds = req.body.validitySeconds ?? (req.body.expiresIn ? Number(req.body.expiresIn) : 300);
+    const validitySeconds = req.body.validitySeconds ?? 5; // Default 5 seconds for auto-refresh
+    const classType = req.body.classType || 'Theory';
     const facultyId = req.user.uid;
 
     // Validate required inputs early with clear message
@@ -1144,11 +1402,57 @@ app.post('/api/faculty/generate-qr', verifyToken, async (req, res) => {
       presentCount: 0,
       totalStudents: 0,
       isActive: true,
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      qrVersion: 1, // Start with version 1
+      qrRefreshInterval: validitySeconds,
+      classType
     });
 
     const sessionRef = await db.collection('sessions').add(sessionData);
     const sessionId = sessionRef.id;
+
+    // AUTO-CREATE ABSENT RECORDS FOR ALL ENROLLED STUDENTS
+    const enrollmentsSnapshot = await db.collection('enrollments')
+      .where('courseId', '==', courseId)
+      .where('isActive', '==', true)
+      .get();
+
+    const batch = db.batch();
+    let studentCount = 0;
+
+    if (!enrollmentsSnapshot.empty) {
+      const studentIds = enrollmentsSnapshot.docs.map(d => d.data().studentId);
+
+      const studentDocs = await Promise.all(studentIds.map(id => db.collection('students').doc(id).get()));
+
+      for (const studentDoc of studentDocs) {
+        if (!studentDoc.exists) continue;
+        const studentData = studentDoc.data();
+        const studentId = studentDoc.id;
+
+        const attendanceRef = db.collection('attendance').doc();
+        batch.set(attendanceRef, {
+          sessionId,
+          courseId,
+          studentId,
+          studentName: studentData.name || 'Unknown',
+          studentRollNo: studentData.rollNo || 'N/A',
+          courseName: course.name,
+          courseCode: course.code,
+          status: 'absent', // Default status
+          markedAt: null,
+          markedBy: 'system',
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          qrVersion: null,
+          classType
+        });
+        studentCount++;
+      }
+    }
+
+    // Update session with total students
+    batch.update(sessionRef, { totalStudents: studentCount });
+    await batch.commit();
 
     // Generate QR payload
     const qrPayload = generateQRPayload(
@@ -1158,6 +1462,7 @@ app.post('/api/faculty/generate-qr', verifyToken, async (req, res) => {
       { latitude, longitude, radius },
       validitySeconds * 1000
     );
+    qrPayload.qrVersion = 1; // Add version
 
     // Store active QR
     await db.collection('activeQRs').doc(sessionId).set(cleanObject({
@@ -1171,12 +1476,71 @@ app.post('/api/faculty/generate-qr', verifyToken, async (req, res) => {
       qrData: JSON.stringify(cleanObject(qrPayload)),
       qrPayload: cleanObject(qrPayload),
       expiresIn: validitySeconds,
-      session: { id: sessionId, ...sessionData }
+      session: { id: sessionId, ...sessionData, totalStudents: studentCount }
     });
 
   } catch (error) {
     console.error('Error generating QR:', error);
     res.status(500).json({ error: 'Failed to generate QR code' });
+  }
+});
+
+// Refresh QR Code
+app.post('/api/faculty/refresh-qr', verifyToken, async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+
+    if (!sessionId) {
+      return res.status(400).json({ error: 'sessionId is required' });
+    }
+
+    // Get session
+    const sessionDoc = await db.collection('sessions').doc(sessionId).get();
+    if (!sessionDoc.exists) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    const session = sessionDoc.data();
+    if (!session.isActive) {
+      return res.status(400).json({ error: 'Session is not active' });
+    }
+
+    // Increment version
+    const newVersion = (session.qrVersion || 0) + 1;
+    await sessionDoc.ref.update({ qrVersion: newVersion });
+
+    // Generate new QR payload
+    const validitySeconds = session.qrRefreshInterval || 5;
+    const qrPayload = generateQRPayload(
+      sessionId,
+      session.courseId,
+      session.facultyId,
+      {
+        latitude: session.locationLatitude,
+        longitude: session.locationLongitude,
+        radius: session.geofenceRadius
+      },
+      validitySeconds * 1000
+    );
+    qrPayload.qrVersion = newVersion;
+
+    // Update active QR
+    await db.collection('activeQRs').doc(sessionId).set(cleanObject({
+      ...qrPayload,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    }));
+
+    res.json({
+      success: true,
+      qrData: JSON.stringify(cleanObject(qrPayload)),
+      qrPayload: cleanObject(qrPayload),
+      expiresIn: validitySeconds,
+      qrVersion: newVersion
+    });
+
+  } catch (error) {
+    console.error('Error refreshing QR:', error);
+    res.status(500).json({ error: 'Failed to refresh QR code' });
   }
 });
 
@@ -1300,12 +1664,14 @@ app.get('/api/faculty/course/:courseId/students', verifyToken, async (req, res) 
 });
 
 // Manual attendance marking for a session
+// Manual attendance marking for a session
 app.post('/api/faculty/session/:sessionId/manual-attendance', verifyToken, async (req, res) => {
   try {
     const { sessionId } = req.params;
-    const { presentStudentIds } = req.body; // array of student IDs marked present
-    if (!Array.isArray(presentStudentIds)) {
-      return res.status(400).json({ error: 'presentStudentIds must be an array' });
+    const { studentId, status } = req.body;
+
+    if (!studentId || !['present', 'absent'].includes(status)) {
+      return res.status(400).json({ error: 'studentId and status (present/absent) are required' });
     }
 
     // Verify session exists and belongs to faculty
@@ -1318,61 +1684,66 @@ app.post('/api/faculty/session/:sessionId/manual-attendance', verifyToken, async
       return res.status(403).json({ error: 'Not authorized for this session' });
     }
 
-    // Fetch current present attendees
-    const currentSnapshot = await db.collection('attendance')
+    // Find attendance record
+    const attendanceSnapshot = await db.collection('attendance')
       .where('sessionId', '==', sessionId)
+      .where('studentId', '==', studentId)
+      .limit(1)
       .get();
 
-    const currentPresentIds = new Set(
-      currentSnapshot.docs
-        .filter(d => d.data().status === 'present')
-        .map(d => d.data().studentId)
-    );
+    let previousStatus = 'absent'; // Default if creating new
 
-    // Determine adds and removals
-    const newPresentSet = new Set(presentStudentIds);
-    const toAdd = presentStudentIds.filter(id => !currentPresentIds.has(id));
-    const toRemove = Array.from(currentPresentIds).filter(id => !newPresentSet.has(id));
+    if (attendanceSnapshot.empty) {
+      // Create new record if not found (e.g. late enrollment)
+      // Fetch student details
+      const studentDoc = await db.collection('students').doc(studentId).get();
+      if (!studentDoc.exists) {
+        return res.status(404).json({ error: 'Student not found' });
+      }
+      const studentData = studentDoc.data();
 
-    // Apply additions
-    for (const studentId of toAdd) {
+      const courseDoc = await db.collection('courses').doc(session.courseId).get();
+      const course = courseDoc.data();
+
       await db.collection('attendance').add({
         sessionId,
         courseId: session.courseId,
         studentId,
-        status: 'present',
-        markedAt: admin.firestore.FieldValue.serverTimestamp(),
-        markedBy: 'faculty',
-        locationVerified: false,
-        manual: true
+        studentName: studentData.name || 'Unknown',
+        studentRollNo: studentData.rollNo || 'N/A',
+        courseName: course.name || 'Unknown',
+        courseCode: course.code || 'N/A',
+        status,
+        markedAt: status === 'present' ? admin.firestore.FieldValue.serverTimestamp() : null,
+        markedBy: 'manual_faculty',
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
-    }
+    } else {
+      const doc = attendanceSnapshot.docs[0];
+      previousStatus = doc.data().status;
 
-    // Apply removals (mark as absent)
-    for (const studentId of toRemove) {
-      const existing = currentSnapshot.docs.find(d => d.data().studentId === studentId && d.data().status === 'present');
-      if (existing) {
-        await db.collection('attendance').doc(existing.id).update({
-          status: 'absent',
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          markedBy: 'faculty',
-          manual: true
+      if (previousStatus !== status) {
+        await doc.ref.update({
+          status,
+          markedBy: 'manual_faculty',
+          markedAt: status === 'present' ? admin.firestore.FieldValue.serverTimestamp() : null
         });
       }
     }
 
-    // Update presentCount delta
-    const delta = toAdd.length - toRemove.length;
-    if (delta !== 0) {
+    // Update session present count if status changed
+    if (previousStatus !== status) {
+      const increment = status === 'present' ? 1 : -1;
       await db.collection('sessions').doc(sessionId).update({
-        presentCount: admin.firestore.FieldValue.increment(delta)
+        presentCount: admin.firestore.FieldValue.increment(increment)
       });
     }
 
-    res.json({ success: true, added: toAdd.length, removed: toRemove.length });
+    res.json({ success: true, message: `Student marked ${status}` });
+
   } catch (error) {
-    console.error('Error in manual attendance:', error);
-    res.status(500).json({ error: 'Failed to save manual attendance' });
+    console.error('Error marking manual attendance:', error);
+    res.status(500).json({ error: 'Failed to mark attendance' });
   }
 });
 
