@@ -1665,6 +1665,7 @@ app.get('/api/faculty/course/:courseId/students', verifyToken, async (req, res) 
 
 // Get attendance grid for a course (all students x all sessions)
 app.get('/api/faculty/course/:courseId/attendance-grid', verifyToken, async (req, res) => {
+  console.log(`[DEBUG] Attendance Grid Request for course: ${req.params.courseId}`);
   try {
     const { courseId } = req.params;
     const facultyId = req.user.uid;
@@ -1672,10 +1673,12 @@ app.get('/api/faculty/course/:courseId/attendance-grid', verifyToken, async (req
     // Verify requesting user is faculty for this course
     const courseDoc = await db.collection('courses').doc(courseId).get();
     if (!courseDoc.exists) {
+      console.log('[DEBUG] Course not found');
       return res.status(404).json({ error: 'Course not found' });
     }
     const course = courseDoc.data();
     if (course.facultyId !== facultyId) {
+      console.log('[DEBUG] Not authorized');
       return res.status(403).json({ error: 'Not authorized for this course' });
     }
 
@@ -1756,6 +1759,7 @@ app.get('/api/faculty/course/:courseId/attendance-grid', verifyToken, async (req
       };
     });
 
+    console.log(`[DEBUG] Success. Found ${students.length} students, ${sessions.length} sessions`);
     res.json({
       success: true,
       students: result,
