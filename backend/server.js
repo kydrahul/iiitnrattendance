@@ -1805,7 +1805,8 @@ app.get('/api/faculty/course/:courseId/attendance-grid', verifyToken, async (req
         id: doc.id,
         date: data.date?.toDate?.() || new Date(),
         startTime: data.startTime || 'N/A',
-        roomNumber: data.roomNumber || 'N/A'
+        roomNumber: data.roomNumber || 'N/A',
+        type: data.classType || 'Theory'
       };
     });
 
