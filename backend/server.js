@@ -289,6 +289,50 @@ async function verifyToken(req, res, next) {
   }
 }
 
+// Middleware to verify device binding
+async function verifyDeviceBinding(req, res, next) {
+  const deviceId = req.headers['x-device-id'];
+  const userId = req.user.uid;
+
+  if (!deviceId) {
+    return res.status(400).json({ error: 'Device ID required' });
+  }
+
+  try {
+    // Check cache first
+    const cacheKey = `student:${userId}`;
+    let student = studentCache.get(cacheKey);
+
+    if (!student) {
+      const studentDoc = await db.collection('students').doc(userId).get();
+
+      if (!studentDoc.exists) {
+        return res.status(404).json({ error: 'Student profile not found' });
+      }
+
+      student = studentDoc.data();
+      studentCache.set(cacheKey, student);
+    }
+
+    // Check if device is bound and matches
+    if (student.deviceId && student.deviceId !== deviceId) {
+      console.log(`❌ Device mismatch for ${userId}: expected ${student.deviceId}, got ${deviceId}`);
+      return res.status(403).json({
+        error: 'Device not authorized',
+        message: 'This account is bound to a different device. Please contact your administrator.',
+        boundDevice: student.deviceId,
+        currentDevice: deviceId
+      });
+    }
+
+    next();
+  } catch (error) {
+    console.error('Device verification error:', error);
+    res.status(500).json({ error: 'Device verification failed' });
+  }
+}
+
+
 // ============================================
 // API ROUTES
 // ============================================
@@ -340,9 +384,33 @@ app.post('/api/student/profile', verifyToken, async (req, res) => {
       mobileNumber,
       passingYear,
       passingOutYear,
-      branch
+      branch,
+      deviceId
     } = req.body;
     const userId = req.user.uid;
+
+    // Validate device ID
+    if (!deviceId) {
+      return res.status(400).json({ error: 'Device ID is required' });
+    }
+
+    // Get existing student data
+    const studentDoc = await db.collection('students').doc(userId).get();
+
+    if (studentDoc.exists) {
+      const existingData = studentDoc.data();
+
+      // Check if device is already bound to a different device
+      if (existingData.deviceId && existingData.deviceId !== deviceId) {
+        console.log(`❌ Device binding conflict for ${userId}: existing ${existingData.deviceId}, new ${deviceId}`);
+        return res.status(403).json({
+          error: 'Device mismatch',
+          message: 'This account is already bound to another device. Please contact your administrator to unbind your previous device.',
+          boundDevice: existingData.deviceId,
+          currentDevice: deviceId
+        });
+      }
+    }
 
     const studentData = cleanObject({
       userId,
@@ -356,6 +424,8 @@ app.post('/api/student/profile', verifyToken, async (req, res) => {
       department: department || branch,
       mobile: mobile || mobileNumber,
       passingYear: passingYear || passingOutYear,
+      deviceId, // Store device ID
+      deviceBoundAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
@@ -364,6 +434,8 @@ app.post('/api/student/profile', verifyToken, async (req, res) => {
 
     // Invalidate cache when profile is updated
     invalidateStudentCache(userId);
+
+    console.log(`✅ Device bound for ${userId}: ${deviceId}`);
 
     res.json({ success: true, student: studentData });
   } catch (error) {
@@ -377,15 +449,19 @@ app.get('/api/student/profile', verifyToken, async (req, res) => {
   try {
     const userId = req.user.uid;
 
-    // Check cache first
-    const cacheKey = `student:${userId}`;
-    const cached = studentCache.get(cacheKey);
-    if (cached) {
-      console.log(`✅ Cache hit: profile for ${userId}`);
-      return res.json({ success: true, student: cached });
+    // Check cache first (unless nocache is requested)
+    const { nocache } = req.query;
+
+    if (nocache !== 'true') {
+      const cacheKey = `student:${userId}`;
+      const cached = studentCache.get(cacheKey);
+      if (cached) {
+        console.log(`✅ Cache hit: profile for ${userId}`);
+        return res.json({ success: true, student: cached });
+      }
     }
 
-    console.log(`👤 Cache miss: fetching profile for ${userId}`);
+    console.log(`👤 Fetching profile for ${userId} (Cache skipped: ${nocache === 'true'})`);
 
     // Get student data from Firestore
     const studentDoc = await db.collection('students').doc(userId).get();
