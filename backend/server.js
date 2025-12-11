@@ -448,12 +448,12 @@ app.post('/api/student/profile', verifyToken, async (req, res) => {
 app.get('/api/student/profile', verifyToken, async (req, res) => {
   try {
     const userId = req.user.uid;
+    const cacheKey = `student:${userId}`; // Define at function scope
 
     // Check cache first (unless nocache is requested)
     const { nocache } = req.query;
 
     if (nocache !== 'true') {
-      const cacheKey = `student:${userId}`;
       const cached = studentCache.get(cacheKey);
       if (cached) {
         console.log(`✅ Cache hit: profile for ${userId}`);
