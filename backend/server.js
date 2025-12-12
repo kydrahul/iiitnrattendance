@@ -1295,6 +1295,51 @@ app.get('/api/student/timetable', verifyToken, async (req, res) => {
 });
 
 
+// Get Student Attendance History
+app.get('/api/student/attendance-history', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const { courseId } = req.query;
+
+    let query = db.collection('attendance')
+      .where('studentId', '==', userId)
+      .orderBy('createdAt', 'desc');
+
+    if (courseId) {
+      query = db.collection('attendance')
+        .where('studentId', '==', userId)
+        .where('courseId', '==', courseId)
+        .orderBy('createdAt', 'desc');
+    }
+
+    const snapshot = await query.get();
+    const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+    const attendanceRecords = snapshot.docs.map(doc => {
+      const data = doc.data();
+      const dateVal = data.markedAt?.toDate() || data.createdAt?.toDate() || new Date();
+      const dayName = days[dateVal.getDay()];
+
+      return {
+        id: doc.id,
+        courseId: data.courseId,
+        courseName: data.courseName,
+        status: data.status,
+        date: dateVal.toISOString().split('T')[0],
+        day: dayName,
+        time: dateVal.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' }),
+        type: data.classType || 'Theory', // Fallback to Theory
+        markedAt: data.markedAt || data.createdAt
+      };
+    });
+
+    res.json({ success: true, attendanceRecords });
+  } catch (error) {
+    console.error('Error fetching attendance history:', error);
+    res.status(500).json({ error: 'Failed to fetch attendance history PO' });
+  }
+});
+
 // ============================================
 // FACULTY ROUTES
 // ============================================
