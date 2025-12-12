@@ -172,7 +172,7 @@ function invalidateCourseCache(courseId) {
 
 const requestCounts = new Map();
 const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
-const RATE_LIMIT_MAX = 100; // 100 requests per window
+const RATE_LIMIT_MAX = 1000; // 1000 requests per window (relaxed for dev)
 
 function rateLimiter(req, res, next) {
   const ip = req.ip || req.connection.remoteAddress;
